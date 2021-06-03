@@ -4,7 +4,7 @@ import (
 	"context"
 	"net"
 	"net/url"
-	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-kratos/kratos/v2/api/metadata"
@@ -12,7 +12,6 @@ import (
 	"github.com/go-kratos/kratos/v2/internal/host"
 	"github.com/go-kratos/kratos/v2/log"
 	"github.com/go-kratos/kratos/v2/middleware"
-	"github.com/go-kratos/kratos/v2/middleware/recovery"
 	"github.com/go-kratos/kratos/v2/transport"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
@@ -61,6 +60,13 @@ func Middleware(m ...middleware.Middleware) ServerOption {
 	}
 }
 
+// UnaryInterceptor returns a ServerOption that sets the UnaryServerInterceptor for the server.
+func UnaryInterceptor(in ...grpc.UnaryServerInterceptor) ServerOption {
+	return func(s *Server) {
+		s.ints = in
+	}
+}
+
 // Options with grpc options.
 func Options(opts ...grpc.ServerOption) ServerOption {
 	return func(s *Server) {
@@ -73,12 +79,15 @@ type Server struct {
 	*grpc.Server
 	ctx        context.Context
 	lis        net.Listener
+	once       sync.Once
+	err        error
 	network    string
 	address    string
 	endpoint   *url.URL
 	timeout    time.Duration
 	log        *log.Helper
 	middleware middleware.Middleware
+	ints       []grpc.UnaryServerInterceptor
 	grpcOpts   []grpc.ServerOption
 	health     *health.Server
 	metadata   *metadata.Server
@@ -90,19 +99,20 @@ func NewServer(opts ...ServerOption) *Server {
 		network: "tcp",
 		address: ":0",
 		timeout: 1 * time.Second,
-		middleware: middleware.Chain(
-			recovery.Recovery(),
-		),
-		health: health.NewServer(),
-		log:    log.NewHelper(log.DefaultLogger),
+		health:  health.NewServer(),
+		log:     log.NewHelper(log.DefaultLogger),
 	}
 	for _, o := range opts {
 		o(srv)
 	}
+	var ints = []grpc.UnaryServerInterceptor{
+		srv.unaryServerInterceptor(),
+	}
+	if len(srv.ints) > 0 {
+		ints = append(ints, srv.ints...)
+	}
 	var grpcOpts = []grpc.ServerOption{
-		grpc.ChainUnaryInterceptor(
-			srv.unaryServerInterceptor(),
-		),
+		grpc.ChainUnaryInterceptor(ints...),
 	}
 	if len(srv.grpcOpts) > 0 {
 		grpcOpts = append(grpcOpts, srv.grpcOpts...)
@@ -120,35 +130,33 @@ func NewServer(opts ...ServerOption) *Server {
 // examples:
 //   grpc://127.0.0.1:9000?isSecure=false
 func (s *Server) Endpoint() (*url.URL, error) {
-	if s.lis == nil && strings.HasSuffix(s.address, ":0") {
+	s.once.Do(func() {
 		lis, err := net.Listen(s.network, s.address)
 		if err != nil {
-			return nil, err
+			s.err = err
+			return
+		}
+		addr, err := host.Extract(s.address, s.lis)
+		if err != nil {
+			lis.Close()
+			s.err = err
+			return
 		}
 		s.lis = lis
+		s.endpoint = &url.URL{Scheme: "grpc", Host: addr}
+	})
+	if s.err != nil {
+		return nil, s.err
 	}
-	addr, err := host.Extract(s.address, s.lis)
-	if err != nil {
-		return nil, err
-	}
-	u := &url.URL{
-		Scheme: "grpc",
-		Host:   addr,
-	}
-	s.endpoint = u
-	return u, nil
+	return s.endpoint, nil
 }
 
 // Start start the gRPC server.
 func (s *Server) Start(ctx context.Context) error {
-	s.ctx = ctx
-	if s.lis == nil {
-		lis, err := net.Listen(s.network, s.address)
-		if err != nil {
-			return err
-		}
-		s.lis = lis
+	if _, err := s.Endpoint(); err != nil {
+		return err
 	}
+	s.ctx = ctx
 	s.log.Infof("[gRPC] server listening on: %s", s.lis.Addr().String())
 	s.health.Resume()
 	return s.Serve(s.lis)
@@ -166,8 +174,8 @@ func (s *Server) unaryServerInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		ctx, cancel := ic.Merge(ctx, s.ctx)
 		defer cancel()
-		ctx = transport.NewContext(ctx, transport.Transport{Kind: transport.KindGRPC})
-		ctx = NewServerContext(ctx, ServerInfo{Server: info.Server, FullMethod: info.FullMethod, Endpoint: s.endpoint})
+		ctx = transport.NewContext(ctx, transport.Transport{Kind: transport.KindGRPC, Endpoint: s.endpoint.String()})
+		ctx = NewServerContext(ctx, ServerInfo{Server: info.Server, FullMethod: info.FullMethod})
 		if s.timeout > 0 {
 			var cancel context.CancelFunc
 			ctx, cancel = context.WithTimeout(ctx, s.timeout)
