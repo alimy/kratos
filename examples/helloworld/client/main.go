@@ -36,6 +36,12 @@ func callHTTP() {
 	}
 	log.Printf("[http] SayHello %s\n", reply.Message)
 
+	result, err := client.SayBye(context.Background(), &pb.ByeRequest{Name: "kratos"})
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("[grpc] SayBye %s\n", result.Body.Message)
+
 	// returns error
 	reply, err = client.SayHello(context.Background(), &pb.HelloRequest{Name: "error"})
 	if err != nil {
@@ -60,11 +66,18 @@ func callGRPC() {
 		log.Fatal(err)
 	}
 	client := pb.NewGreeterClient(conn)
+
 	reply, err := client.SayHello(context.Background(), &pb.HelloRequest{Name: "kratos"})
 	if err != nil {
 		log.Fatal(err)
 	}
 	log.Printf("[grpc] SayHello %+v\n", reply)
+
+	result, err := client.SayBye(context.Background(), &pb.ByeRequest{Name: "kratos"})
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("[grpc] SayBye %+v\n", result)
 
 	// returns error
 	_, err = client.SayHello(context.Background(), &pb.HelloRequest{Name: "error"})
