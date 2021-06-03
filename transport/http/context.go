@@ -28,7 +28,6 @@ func FromServerContext(ctx context.Context) (info ServerInfo, ok bool) {
 type ClientInfo struct {
 	Request     *http.Request
 	PathPattern string
-	Target      string
 }
 
 type clientKey struct{}

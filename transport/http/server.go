@@ -3,10 +3,10 @@ package http
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"net/http"
-	"strings"
+	"net/url"
+	"sync"
 	"time"
 
 	ic "github.com/go-kratos/kratos/v2/internal/context"
@@ -54,13 +54,16 @@ func Logger(logger log.Logger) ServerOption {
 // Server is an HTTP server wrapper.
 type Server struct {
 	*http.Server
-	ctx     context.Context
-	lis     net.Listener
-	network string
-	address string
-	timeout time.Duration
-	router  *mux.Router
-	log     *log.Helper
+	ctx      context.Context
+	lis      net.Listener
+	once     sync.Once
+	err      error
+	network  string
+	address  string
+	endpoint *url.URL
+	timeout  time.Duration
+	router   *mux.Router
+	log      *log.Helper
 }
 
 // NewServer creates an HTTP server by options.
@@ -98,10 +101,10 @@ func (s *Server) HandleFunc(path string, h http.HandlerFunc) {
 func (s *Server) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	ctx, cancel := ic.Merge(req.Context(), s.ctx)
 	defer cancel()
-	ctx = transport.NewContext(ctx, transport.Transport{Kind: transport.KindHTTP})
+	ctx = transport.NewContext(ctx, transport.Transport{Kind: transport.KindHTTP, Endpoint: s.endpoint.String()})
 	ctx = NewServerContext(ctx, ServerInfo{Request: req, Response: res})
 	if s.timeout > 0 {
-		ctx, cancel = context.WithTimeout(req.Context(), s.timeout)
+		ctx, cancel = context.WithTimeout(ctx, s.timeout)
 		defer cancel()
 	}
 	s.router.ServeHTTP(res, req.WithContext(ctx))
@@ -110,32 +113,34 @@ func (s *Server) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 // Endpoint return a real address to registry endpoint.
 // examples:
 //   http://127.0.0.1:8000?isSecure=false
-func (s *Server) Endpoint() (string, error) {
-	if s.lis == nil && strings.HasSuffix(s.address, ":0") {
+func (s *Server) Endpoint() (*url.URL, error) {
+	s.once.Do(func() {
 		lis, err := net.Listen(s.network, s.address)
 		if err != nil {
-			return "", err
+			s.err = err
+			return
+		}
+		addr, err := host.Extract(s.address, s.lis)
+		if err != nil {
+			lis.Close()
+			s.err = err
+			return
 		}
 		s.lis = lis
+		s.endpoint = &url.URL{Scheme: "http", Host: addr}
+	})
+	if s.err != nil {
+		return nil, s.err
 	}
-	addr, err := host.Extract(s.address, s.lis)
-	if err != nil {
-		return "", err
-	}
-	s.address = addr
-	return fmt.Sprintf("http://%s", addr), nil
+	return s.endpoint, nil
 }
 
 // Start start the HTTP server.
 func (s *Server) Start(ctx context.Context) error {
-	s.ctx = ctx
-	if s.lis == nil {
-		lis, err := net.Listen(s.network, s.address)
-		if err != nil {
-			return err
-		}
-		s.lis = lis
+	if _, err := s.Endpoint(); err != nil {
+		return err
 	}
+	s.ctx = ctx
 	s.log.Infof("[HTTP] server listening on: %s", s.lis.Addr().String())
 	if err := s.Serve(s.lis); !errors.Is(err, http.ErrServerClosed) {
 		return err
